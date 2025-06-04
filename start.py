@@ -2,12 +2,14 @@ import os
 import time
 import re
 import threading
+from typing import Iterator
 
 import pyautogui
 import keyboard
+import argparse
 
-LOG_PATH = r"C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\console.log"
-PLAYER_NAME = "awall propeller"
+DEFAULT_LOG_PATH = r"C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\console.log"
+DEFAULT_PLAYER_NAME = "awall propeller"
 
 RECONNECT_TEMPLATE = "reconnect_button.png"
 ACCEPT_TEMPLATE    = "accept_button.png"
@@ -20,19 +22,43 @@ ACCEPT_CHECK_INTERVAL = 0.5   # интервал проверки кнопки A
 # -----------------------------------------
 
 auto_accept_enabled = True  # флаг авто-accept
+auto_accept_lock = threading.Lock()
 exit_event = threading.Event()
+last_auto_j = 0.0
 
 
-def tail_log(path):
-    """Генератор строк, типа tail -F."""
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        f.seek(0, os.SEEK_END)
-        while not exit_event.is_set():
-            line = f.readline()
-            if not line:
-                time.sleep(0.1)
-                continue
-            yield line
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Auto disconnect/reconnect helper for CS2"
+    )
+    parser.add_argument(
+        "--log-path",
+        default=os.environ.get("LOG_PATH", DEFAULT_LOG_PATH),
+        help="Path to CS2 console.log",
+    )
+    parser.add_argument(
+        "--player-name",
+        default=os.environ.get("PLAYER_NAME", DEFAULT_PLAYER_NAME),
+        help="Exact player name used in logs",
+    )
+    return parser.parse_args()
+
+
+def tail_log(path: str) -> Iterator[str]:
+    """Yield new lines from log file, waiting if file is missing."""
+    while not exit_event.is_set():
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(0, os.SEEK_END)
+                while not exit_event.is_set():
+                    line = f.readline()
+                    if not line:
+                        time.sleep(0.1)
+                        continue
+                    yield line
+        except FileNotFoundError:
+            print(f"[warn] Log file not found: {path}. Waiting...")
+            time.sleep(1.0)
 
 
 def accept_monitor():
@@ -42,19 +68,25 @@ def accept_monitor():
     Если кнопка найдена и авто-accept включён, кликает по ней.
     """
     while not exit_event.is_set():
-        if auto_accept_enabled:
+        with auto_accept_lock:
+            enabled = auto_accept_enabled
+
+        if enabled:
             try:
                 btn = pyautogui.locateOnScreen(
                     ACCEPT_TEMPLATE,
                     confidence=CONFIDENCE,
-                    grayscale=True
+                    grayscale=True,
                 )
             except pyautogui.ImageNotFoundException:
+                btn = None
+            except Exception as exc:
+                print(f"[error] locateOnScreen: {exc}")
                 btn = None
 
             if btn:
                 print("🔔 Accept button detected, clicking in 1s...")
-                time.sleep(2.0)
+                time.sleep(1.0)
                 x, y = pyautogui.center(btn)
                 pyautogui.click(x, y)
                 print("[match accepted]")
@@ -74,9 +106,15 @@ def cycle_reconnect(tailer, pattern):
 
         print("→ auto-press J (disconnect)")
         pyautogui.press('j')
+        global last_auto_j
+        last_auto_j = time.time()
         time.sleep(AFTER_DISCONNECT_DELAY)
 
-        print(f"…waiting up to {BUTTON_TIMEOUT:.0f}s for Reconnect button…", end="", flush=True)
+        print(
+            f"…waiting up to {BUTTON_TIMEOUT:.0f}s for Reconnect button…",
+            end="",
+            flush=True,
+        )
         start = time.time()
         btn = None
         while time.time() - start < BUTTON_TIMEOUT and not exit_event.is_set():
@@ -84,9 +122,12 @@ def cycle_reconnect(tailer, pattern):
                 btn = pyautogui.locateOnScreen(
                     RECONNECT_TEMPLATE,
                     confidence=CONFIDENCE,
-                    grayscale=True
+                    grayscale=True,
                 )
             except pyautogui.ImageNotFoundException:
+                btn = None
+            except Exception as exc:
+                print(f"[error] locateOnScreen reconnect: {exc}")
                 btn = None
             if btn:
                 print(" found!")
@@ -100,29 +141,40 @@ def cycle_reconnect(tailer, pattern):
         print(f"→ click reconnect at ({x},{y})")
         pyautogui.click(x, y)
 
-        print("…waiting for actual reconnect in log (skip duplicate)…")
-        skip_once = True
+        print("…waiting for reconnect confirmation in log…")
         for line in tailer:
             if pattern.search(line):
-                if skip_once:
-                    print("[skip dup ]", line.strip())
-                    skip_once = False
-                    continue
                 print("[got reconnect]", line.strip())
                 break
 
 
-def toggle_accept():
+def toggle_accept() -> None:
     global auto_accept_enabled
-    auto_accept_enabled = not auto_accept_enabled
-    status = 'ENABLED' if auto_accept_enabled else 'DISABLED'
+    with auto_accept_lock:
+        auto_accept_enabled = not auto_accept_enabled
+        status = "ENABLED" if auto_accept_enabled else "DISABLED"
     print(f"🔁 Auto-accept {status}")
 
 
-def main():
+def wait_for_manual_j() -> None:
+    """Block until user presses 'j' ignoring our automated presses."""
+    while True:
+        event = keyboard.read_event()
+        if event.name == "j" and event.event_type == keyboard.KEY_DOWN:
+            if time.time() - last_auto_j > 0.5:
+                break
+
+
+def main() -> None:
+    args = parse_args()
+
+    global LOG_PATH, PLAYER_NAME
+    LOG_PATH = args.log_path
+    PLAYER_NAME = args.player_name
+
     threading.Thread(target=accept_monitor, daemon=True).start()
 
-    keyboard.add_hotkey('f2', toggle_accept)
+    keyboard.add_hotkey("f2", toggle_accept)
     print("Press F2 to toggle auto-accept on/off.")
 
     pattern = re.compile(rf"\b{re.escape(PLAYER_NAME)} connected\b", re.IGNORECASE)
@@ -139,7 +191,7 @@ def main():
                     break
 
             print("Press J once (after 1st round starts) to begin auto-cycle.")
-            keyboard.wait('j')
+            wait_for_manual_j()
             print("[manual J   ] starting auto-reconnect loop…")
 
             cycle_reconnect(tailer, pattern)
